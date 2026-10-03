@@ -1,0 +1,38 @@
+#!/bin/bash
+
+IMG=rtr
+RTR_OPTS="--network br0 --privileged -v ./daemons:/etc/frr/daemons"
+
+RTRS="R1 R2 H1 H2"
+
+function start()
+{
+	podman network create -d bridge -o mode=unmanaged --interface-name=br0 --disable-dns --ipam-driver=none br0
+	for R in $RTRS
+	do
+		podman run -td --name $R \
+			$RTR_OPTS \
+			-v ./$R.conf:/etc/frr/frr.conf \
+			--hostname $R \
+			--entrypoint '["/bin/bash", "-c", "/usr/lib/frr/frrinit.sh start ; tail -f /dev/null"]' \
+			$IMG
+	done
+}
+
+function stop()
+{
+	for R in $RTRS
+	do
+		podman stop $R && podman rm $R &
+	done
+	wait
+	podman network rm br0
+}
+
+function restart()
+{
+	stop
+	start
+}
+
+$@
