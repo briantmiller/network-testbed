@@ -1,32 +1,95 @@
 #!/bin/bash
 
 IMG=rtr
-RTR_OPTS="--network br0 --privileged -v ./daemons:/etc/frr/daemons"
+#RTR_OPTS="--network br0 --privileged -v ./daemons:/etc/frr/daemons"
+RTR_OPTS="--privileged -v ./daemons:/etc/frr/daemons"
 
-RTRS="R1 R2 H1 H2"
+#RTRS="R1:net0,wan1 R2:net0,wan2 R3:wan1,wan2 H1:net0 H2:net0"
+RTRS="R1:net0,wan1 R2:net0,wan2 H1:net0 H2:net0"
+BRIDGES="net0 wan1 wan2"
+
 
 function start()
 {
-	podman network create -d bridge -o mode=unmanaged --interface-name=br0 --disable-dns --ipam-driver=none br0
-	for R in $RTRS
+	for BR in $BRIDGES
 	do
-		podman run -td --name $R \
+		ip link show type bridge | grep -q $BR || ip link add $BR type bridge && ip link set $BR up
+		ip link set dev $BR type bridge mcast_querier 1
+		ip link set dev $BR type bridge mcast_snooping 0
+		podman network create -d bridge -o mode=unmanaged --interface-name=$BR --disable-dns --ipam-driver=none $BR
+		#RTR_OPTS="$RTR_OPTS --network $BR"
+	done
+	echo 1 > /proc/sys/net/ipv4/ip_forward
+	for RN in $RTRS
+	do
+		R=$(echo "$RN" | cut -f 1 -d :)
+		NETS=$(echo "$RN" | cut -f 2 -d : | tr ',' ' ')
+		NET_OPTS=""
+		#mkdir -p /var/run/bpf/$R
+		#mount -t bpf bpffs /var/run/bpf/$R
+		#NET_OPS="$NET_OPTS -v /var/run/bpf/$R:/sys/fs/bpf:shared"
+		NET_OPTS="$NET_OPTS --mount type=tmpfs,destination=/sys/fs/bpf,tmpfs-mode=0700 --security-opt seccomp=unconfined"
+		for N in $NETS
+		do
+			NET_OPTS="$NET_OPTS --network $N:interface_name=$N"
+		done
+		#if [ -d $R-files/etc/bpfc/interfaces.d ]
+		#then
+		#	NET_OPTS="$NET_OPTS -v ./$R-files/etc/bpfc/interfaces.d:/etc/bpfc/interfaces.d"
+		#fi
+		podman run -dt --name $R \
 			$RTR_OPTS \
+			$NET_OPTS \
 			-v ./$R.conf:/etc/frr/frr.conf \
 			--hostname $R \
-			--entrypoint '["/bin/bash", "-c", "/usr/lib/frr/frrinit.sh start ; tail -f /dev/null"]' \
+			--entrypoint '["/bin/bash", "-c", "mount -t bpf bpf /sys/fs/bpf; /usr/lib/frr/frrinit.sh start ; /usr/sbin/bpfcd -b ;tail -f /dev/null"]' \
 			$IMG
+		NETNS=$(podman inspect $R --format '{{.NetworkSettings.SandboxKey}}')
+		ln -s $NETNS /var/run/netns/$R
 	done
+	ip link add link wan1 name wan1.100 type vlan id 100
+	ip link add link wan2 name wan2.100 type vlan id 100
+	tc qdisc add dev wan1.100 root netem \
+		rate 10mbit \
+		delay 100ms 20ms \
+		loss 1%
+	tc qdisc add dev wan2.100 root netem \
+		rate 20mbit \
+		delay 200ms 20ms \
+		loss 0.5%
+	ip link add wan100 type bridge
+	ip link set wan1.100 master wan100
+	ip link set wan2.100 master wan100
+	for I in wan100 wan1.100 wan2.100
+	do
+		ip link set $I up
+	done
+	ip link set dev wan100 type bridge mcast_querier 1
+	ip link set dev wan100 type bridge mcast_snooping 0
 }
 
 function stop()
 {
-	for R in $RTRS
+	for RN in $RTRS
 	do
+		R=$(echo "$RN" | cut -f 1 -d :)
 		podman stop $R && podman rm $R &
+		rm -f /var/run/netns/$R
+		#true
+		#while [ $? -eq 0 ]
+		#do
+		#	umount /var/run/bpf/$R
+		#	mount | grep -q /var/run/bpf/$R
+		#done
 	done
 	wait
-	podman network rm br0
+	for BR in $BRIDGES
+        do
+		podman network rm $BR
+	done
+	ip link del dev wan1.100
+	ip link del dev wan2.100
+	ip link del dev wan100
 }
 
 function restart()
