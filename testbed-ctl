@@ -3,6 +3,12 @@
 IMG=rtr
 #RTR_OPTS="--network br0 --privileged -v ./daemons:/etc/frr/daemons"
 RTR_OPTS="--privileged -v ./daemons:/etc/frr/daemons"
+RTR_OPTS="$RTR_OPTS --cap-add=BPF --cap-add=SYS_ADMIN"
+RTR_OPTS="$RTR_OPTS --security-opt label=disable"
+RTR_OPTS="$RTR_OPTS --security-opt unmask=/sys/fs/bpf"
+RTR_OPTS="$RTR_OPTS --security-opt seccomp=unconfined"
+RTR_OPTS="$RTR_OPTS --userns=host"
+#RTR_OPTS="$RTR_OPTS -v /sys/fs/bpf:/sys/fs/bpf:rw,Z"
 
 #RTRS="R1:net0,wan1 R2:net0,wan2 R3:wan1,wan2 H1:net0 H2:net0"
 RTRS="R1:net0,wan1 R2:net0,wan2 H1:net0 H2:net0"
@@ -20,6 +26,8 @@ function start()
 		#RTR_OPTS="$RTR_OPTS --network $BR"
 	done
 	echo 1 > /proc/sys/net/ipv4/ip_forward
+	ENTRYPOINT='["/bin/bash", "-c", "mount -t bpf bpf /sys/fs/bpf; /usr/lib/frr/frrinit.sh start ; /usr/sbin/bpfcd -b ;tail -f /dev/null"]'
+	#ENTRYPOINT='["/bin/bash", "-c", "/usr/lib/frr/frrinit.sh start ; /usr/sbin/bpfcd -b ;tail -f /dev/null"]'
 	for RN in $RTRS
 	do
 		R=$(echo "$RN" | cut -f 1 -d :)
@@ -27,40 +35,47 @@ function start()
 		NET_OPTS=""
 		#mkdir -p /var/run/bpf/$R
 		#mount -t bpf bpffs /var/run/bpf/$R
-		#NET_OPS="$NET_OPTS -v /var/run/bpf/$R:/sys/fs/bpf:shared"
-		NET_OPTS="$NET_OPTS --mount type=tmpfs,destination=/sys/fs/bpf,tmpfs-mode=0700 --security-opt seccomp=unconfined"
+		#mount --make-shared /var/run/bpf/$R
+		#NET_OPTS="$NET_OPTS --mount type=bind,src=/var/run/bpf/$R,target=/var/run/bpf"
+		#NET_OPS="$NET_OPTS -v /sys/fs/bpf:/sys/fs/bpf:rw,Z"
+		#NET_OPS="$NET_OPTS -v /var/run/bpf/$R:/var/run/bpf:rw,Z"
+		#mount --make-shared /sys/fs/bpf
+		mkdir /sys/fs/bpf/$R &> /dev/null
+		#NET_OPTS="$NET_OPTS --mount type=bind,src=/sys/fs/bpf/$R,target=/sys/fs/bpf"
+		NET_OPS="$NET_OPTS -v /sys/fs/bpf/$R:/var/run/bpf"
+		#NET_OPTS="$NET_OPTS --mount type=tmpfs,destination=/sys/fs/bpf,tmpfs-mode=0700 --security-opt seccomp=unconfined"
 		for N in $NETS
 		do
 			NET_OPTS="$NET_OPTS --network $N:interface_name=$N"
 		done
-		#if [ -d $R-files/etc/bpfc/interfaces.d ]
-		#then
-		#	NET_OPTS="$NET_OPTS -v ./$R-files/etc/bpfc/interfaces.d:/etc/bpfc/interfaces.d"
-		#fi
+		if [ -d $R-files/etc/bpfc/interfaces.d ]
+		then
+			NET_OPTS="$NET_OPTS -v ./$R-files/etc/bpfc/interfaces.d:/etc/bpfc/interfaces.d"
+		fi
 		podman run -dt --name $R \
 			$RTR_OPTS \
 			$NET_OPTS \
 			-v ./$R.conf:/etc/frr/frr.conf \
 			--hostname $R \
-			--entrypoint '["/bin/bash", "-c", "mount -t bpf bpf /sys/fs/bpf; /usr/lib/frr/frrinit.sh start ; /usr/sbin/bpfcd -b ;tail -f /dev/null"]' \
+			--entrypoint "$ENTRYPOINT" \
 			$IMG
 		NETNS=$(podman inspect $R --format '{{.NetworkSettings.SandboxKey}}')
 		ln -s $NETNS /var/run/netns/$R
 	done
-	ip link add link wan1 name wan1.100 type vlan id 100
-	ip link add link wan2 name wan2.100 type vlan id 100
-	tc qdisc add dev wan1.100 root netem \
+	ip link add link wan1 name wan1-100 type vlan id 100
+	ip link add link wan2 name wan2-100 type vlan id 100
+	tc qdisc add dev wan1-100 root netem \
 		rate 10mbit \
 		delay 100ms 20ms \
 		loss 1%
-	tc qdisc add dev wan2.100 root netem \
+	tc qdisc add dev wan2-100 root netem \
 		rate 20mbit \
 		delay 200ms 20ms \
 		loss 0.5%
 	ip link add wan100 type bridge
-	ip link set wan1.100 master wan100
-	ip link set wan2.100 master wan100
-	for I in wan100 wan1.100 wan2.100
+	ip link set wan1-100 master wan100
+	ip link set wan2-100 master wan100
+	for I in wan100 wan1-100 wan2-100
 	do
 		ip link set $I up
 	done
@@ -75,20 +90,20 @@ function stop()
 		R=$(echo "$RN" | cut -f 1 -d :)
 		podman stop $R && podman rm $R &
 		rm -f /var/run/netns/$R
-		#true
-		#while [ $? -eq 0 ]
-		#do
-		#	umount /var/run/bpf/$R
-		#	mount | grep -q /var/run/bpf/$R
-		#done
+		true
+		while [ $? -eq 0 ]
+		do
+			umount /var/run/bpf/$R &>/dev/null 
+			mount | grep -q /var/run/bpf/$R
+		done
 	done
 	wait
 	for BR in $BRIDGES
         do
 		podman network rm $BR
 	done
-	ip link del dev wan1.100
-	ip link del dev wan2.100
+	ip link del dev wan1-100
+	ip link del dev wan2-100
 	ip link del dev wan100
 }
 
