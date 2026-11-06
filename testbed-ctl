@@ -49,14 +49,14 @@ function start()
 	done
 	ip link add link wan1 name wan1.100 type vlan id 100
 	ip link add link wan2 name wan2.100 type vlan id 100
-	tc qdisc add dev wan1.100 root netem \
-		rate 10mbit \
-		delay 100ms 20ms \
-		loss 1%
-	tc qdisc add dev wan2.100 root netem \
-		rate 20mbit \
-		delay 200ms 20ms \
-		loss 0.5%
+	#tc qdisc add dev wan1-100 root netem \
+	#	rate 10mbit \
+	#	delay 100ms 20ms \
+	#	loss 1%
+	#tc qdisc add dev wan2-100 root netem \
+	#	rate 20mbit \
+	#	delay 200ms 20ms \
+	#	loss 0.5%
 	ip link add wan100 type bridge
 	ip link set wan1.100 master wan100
 	ip link set wan2.100 master wan100
@@ -66,10 +66,33 @@ function start()
 	done
 	ip link set dev wan100 type bridge mcast_querier 1
 	ip link set dev wan100 type bridge mcast_snooping 0
+	tune
+	./satnetem --up-if wan1.100 --down-if wan2.100 --log satnetem.log &>/dev/null &
+	echo $! > ./satnetem.pid
+}
+
+function tune()
+{
+	local RN R WAN I
+	for RN in R1:wan1 R2:wan2
+	do
+		R=${RN%%:*}; WAN=${RN#*:}
+		ip netns exec $R ethtool -K $WAN tso off gso off gro off >/dev/null
+		ip netns exec $R ethtool -K net0 gro off >/dev/null
+		# the VLAN is created by FRR; wait for it
+		for I in $(seq 30); do ip -n $R link show $WAN.100 &>/dev/null && break; sleep 1; done
+		ip -n $R link set dev $WAN.100 mtu 1492 gso_max_segs 1
+		ip netns exec $R ethtool -K $WAN.100 tso off gso off gro off >/dev/null 2>&1
+	done
+	for R in H1 H2
+	do
+		ip netns exec $R ethtool -K net0 tso off gso off >/dev/null
+	done
 }
 
 function stop()
 {
+	[ -e ./satnetem.pid ] && { pkill -F ./satnetem.pid; rm -f ./satnetem.pid ;}
 	for RN in $RTRS
 	do
 		R=$(echo "$RN" | cut -f 1 -d :)
