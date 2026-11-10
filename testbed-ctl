@@ -3,11 +3,17 @@
 IMG=rtr
 #RTR_OPTS="--network br0 --privileged -v ./daemons:/etc/frr/daemons"
 RTR_OPTS="--privileged -v ./daemons:/etc/frr/daemons"
+RTR_OPTS="$RTR_OPTS --cap-add=BPF --cap-add=SYS_ADMIN"
+RTR_OPTS="$RTR_OPTS --security-opt label=disable"
+RTR_OPTS="$RTR_OPTS --security-opt unmask=/sys/fs/bpf"
+RTR_OPTS="$RTR_OPTS --security-opt seccomp=unconfined"
+RTR_OPTS="$RTR_OPTS --userns=host"
 
 #RTRS="R1:net0,wan1 R2:net0,wan2 R3:wan1,wan2 H1:net0 H2:net0"
 RTRS="R1:net0,wan1 R2:net0,wan2 H1:net0 H2:net0"
 BRIDGES="net0 wan1 wan2"
 
+ENTRYPOINT='["/bin/bash", "-c", "mount -t bpf bpf /sys/fs/bpf; /usr/lib/frr/frrinit.sh start ; /usr/sbin/bpfcd -b ;tail -f /dev/null"]'
 
 function start()
 {
@@ -42,13 +48,42 @@ function start()
 			$NET_OPTS \
 			-v ./$R.conf:/etc/frr/frr.conf \
 			--hostname $R \
-			--entrypoint '["/bin/bash", "-c", "mount -t bpf bpf /sys/fs/bpf; /usr/lib/frr/frrinit.sh start ; /usr/sbin/bpfcd -b ;tail -f /dev/null"]' \
+			--entrypoint "$ENTRYPOINT" \
 			$IMG
 		NETNS=$(podman inspect $R --format '{{.NetworkSettings.SandboxKey}}')
 		ln -s $NETNS /var/run/netns/$R
 	done
-	ip link add link wan1 name wan1.100 type vlan id 100
-	ip link add link wan2 name wan2.100 type vlan id 100
+	[ ! -d logs ] && mkdir logs
+	[ ! -d pids ] && mkdir pids
+	for VLAN in 100 101 102 103 104
+	do
+		ip link add wan$VLAN type bridge
+		ip link add link wan1 name wan1-$VLAN type vlan id $VLAN
+		ip link add link wan2 name wan2-$VLAN type vlan id $VLAN
+		ip link set wan1-$VLAN master wan$VLAN
+		ip link set wan2-$VLAN master wan$VLAN
+		ip link set wan1-$VLAN up
+		ip link set wan2-$VLAN up
+		ip link set wan$VLAN up
+		ip link set dev wan$VLAN type bridge mcast_querier 1
+		ip link set dev wan$VLAN type bridge mcast_snooping 0
+		BW=$(( $VLAN + 1 - 100 ))
+		BW=$(( $BW * 10 ))
+		tc qdisc add dev wan1-$VLAN root netem \
+	               rate ${BW}mbit \
+        	       delay 20ms 2ms \
+	               loss 0.0%
+        	tc qdisc add dev wan2-$VLAN root netem \
+	               rate ${BW}mbit \
+        	       delay 20ms 2ms \
+	               loss 0.0%
+		#./tools/satnetem --up-if wan1-$VLAN --down-if wan2-$VLAN --log logs/satnetem-$VLAN.log &>/dev/null &
+		#echo $! > ./pids/satnetem-$VLAN.pid
+	done
+	for R in R1 R2
+	do
+		ip netns exec $R sysctl -q -w net.ipv4.fib_multipath_hash_policy=1
+	done
 	#tc qdisc add dev wan1-100 root netem \
 	#	rate 10mbit \
 	#	delay 100ms 20ms \
@@ -57,18 +92,8 @@ function start()
 	#	rate 20mbit \
 	#	delay 200ms 20ms \
 	#	loss 0.5%
-	ip link add wan100 type bridge
-	ip link set wan1.100 master wan100
-	ip link set wan2.100 master wan100
-	for I in wan100 wan1.100 wan2.100
-	do
-		ip link set $I up
-	done
-	ip link set dev wan100 type bridge mcast_querier 1
-	ip link set dev wan100 type bridge mcast_snooping 0
-	tune
-	./satnetem --up-if wan1.100 --down-if wan2.100 --log satnetem.log &>/dev/null &
-	echo $! > ./satnetem.pid
+	#tune
+	#./tools/satrelay wan1-100 wan2-100 15000 150000 &> satnetem.log &
 }
 
 function tune()
@@ -81,7 +106,7 @@ function tune()
 		ip netns exec $R ethtool -K net0 gro off >/dev/null
 		# the VLAN is created by FRR; wait for it
 		for I in $(seq 30); do ip -n $R link show $WAN.100 &>/dev/null && break; sleep 1; done
-		ip -n $R link set dev $WAN.100 mtu 1492 gso_max_segs 1
+		#ip -n $R link set dev $WAN.100 mtu 1492 gso_max_segs 1
 		ip netns exec $R ethtool -K $WAN.100 tso off gso off gro off >/dev/null 2>&1
 	done
 	for R in H1 H2
@@ -92,7 +117,13 @@ function tune()
 
 function stop()
 {
-	[ -e ./satnetem.pid ] && { pkill -F ./satnetem.pid; rm -f ./satnetem.pid ;}
+	for VLAN in 100 101 102 103 104
+	do
+		ip link del wan$VLAN
+		ip link del wan1-$VLAN
+                ip link del wan2-$VLAN
+		[ -e ./pids/satnetem-$VLAN.pid ] && { pkill -F ./pids/satnetem-$VLAN.pid; rm -f ./pids/satnetem-$VLAN.pid ;}
+	done
 	for RN in $RTRS
 	do
 		R=$(echo "$RN" | cut -f 1 -d :)
@@ -110,9 +141,6 @@ function stop()
         do
 		podman network rm $BR
 	done
-	ip link del dev wan1.100
-	ip link del dev wan2.100
-	ip link del dev wan100
 }
 
 function restart()
