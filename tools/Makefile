@@ -9,8 +9,11 @@
 #   make CC=clang CFLAGS=-O3
 #   make install PREFIX=/usr DESTDIR=/tmp/pkgroot
 
-PROG    := satnetem
-SRCS    := satnetem.c
+PROG1    := satnetem
+SRCS1    := $(PROG1).c
+
+PROG2    := satrelay
+SRCS2    := $(PROG2).c
 
 CC      ?= cc
 CFLAGS  ?= -O2 -g
@@ -23,17 +26,23 @@ INSTALL ?= install
 
 .PHONY: all clean install uninstall
 
-all: $(PROG)
+all: $(PROG1) $(PROG2)
 
-$(PROG): $(SRCS)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS) $(LDLIBS)
+$(PROG1): $(SRCS1)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS1) $(LDLIBS)
 
-install: $(PROG)
+$(PROG2): $(SRCS2)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS2) $(LDLIBS)
+
+install: $(PROG1)
 	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
-	$(INSTALL) -m 0755 $(PROG) $(DESTDIR)$(SBINDIR)/$(PROG)
+	$(INSTALL) -m 0755 $(PROG1) $(DESTDIR)$(SBINDIR)/$(PROG1)
+	$(INSTALL) -m 0755 $(PROG2) $(DESTDIR)$(SBINDIR)/$(PROG2)
 
 uninstall:
-	rm -f $(DESTDIR)$(SBINDIR)/$(PROG)
+	rm -f $(DESTDIR)$(SBINDIR)/$(PROG1)
+	rm -f $(DESTDIR)$(SBINDIR)/$(PROG2)
 
 clean:
-	rm -f $(PROG)
+	rm -f $(PROG1)
+	rm -f $(PROG2)
