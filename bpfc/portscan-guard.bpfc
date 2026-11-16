@@ -1,0 +1,452 @@
+# portscan-guard.bpfc
+#
+# Defensive IPv4 TCP/UDP port-scan heuristic for bpfc.
+#
+# Scope:
+#   * TCP: records initial SYNs only (SYN without ACK).
+#   * UDP: records the first observed packet for each source/protocol/
+#     destination-port tuple during the scan window; UDP has no connection
+#     handshake, so this is an inferred service-contact record.
+#   * A "new service" is a distinct {source IPv4, protocol, destination port}
+#     contact that has not been observed during WINDOW seconds.
+#   * Each new service contact contributes a static risk weight: 1 for ordinary
+#     ports, 2 for selected management/data/control-plane ports, and 3 for a
+#     short list of rarely legitimate, high-risk administration/data services.
+#     These weights are transport-agnostic in this static version; dynamic,
+#     protocol-aware policy maps can replace them later.
+#
+# Maps:
+#   PS_FLOW  key=(src IPv4 << 32) | (proto << 16) | destination port;
+#            value=last observed CLOCK_MONOTONIC second for that tuple.
+#            It is atomically exchanged to claim a first contact safely.
+#   PS_SCORE key=(floor(monotonic-second / WINDOW) << 32) | source IPv4;
+#            value=atomic weighted score for that fixed scan-time bucket.
+#   PS_LAST  key=source IPv4; value=(last observation second << 32) |
+#            (protocol << 16) | destination port.
+#   PS_BLOCK   key=source IPv4; value=block-until CLOCK_MONOTONIC second (0=not enforced).
+#   PS_BACKOFF key=source IPv4; value=exponential backoff level during active enforcement.
+#   PS_LIMIT   key=0; value=maximum enforcement duration seconds.
+#   PS_CFG     array: 0 threshold; 1 base enforcement duration seconds; 2 debug logging;
+#              3 scan window seconds; 4 enforcement mode (0 monitor, 1 drop, 2 reset).
+#   PS_STATS   array: 0 new distinct services; 1 enforcement entries issued;
+#            2 enforcement packets (dropped or TCP-reset);
+#            3 TCP SYNs observed; 4 UDP packets observed.
+#
+# The generic hash maps are 10,000-entry LRU maps. PS_FLOW, PS_SCORE,
+# PS_BACKOFF, and PS_LIMIT are bounded operational state, not a forensic event
+# store. PS_LIMIT is read under fixed key 0 and is initialized on first use.
+#
+# IMPORTANT: Start in monitor mode (the default), tune the threshold for the
+# environment, then set PS_CFG key 4 to 1 for silent drops or 2 for TCP RST/ACK
+# responses to qualifying TCP SYNs. Use portscanctl.sh to inspect and update
+# runtime settings.
+
+const DEFAULT_THRESHOLD 12;
+const DEFAULT_BLOCK_SECS 900;
+const DEFAULT_MAX_BLOCK_SECS 86400;
+const DEFAULT_WINDOW 60;
+
+array-map PS_CFG 5;
+array-map PS_STATS 5;
+
+set map PS_CFG 4 1;
+
+# Send a TCP RST/ACK that a normal client generally interprets as a closed port.
+# The incoming SYN is rewritten in place and returned on the same interface.
+# It works for IPv4 TCP SYNs with no payload; TCP options are retained as NOPs.
+# SYNs carrying TCP Fast Open data fall back to drop because a RST must not carry
+# the original payload. This is a response mode, not a guarantee of concealment.
+define tcp-port-closed;
+  decl R_SRCMAC_$UNIQUE 8;
+  decl R_DSTMAC_$UNIQUE 8;
+  decl R_IPDST_$UNIQUE 4;
+  decl R_SPORT_$UNIQUE 2;
+  decl R_DPORT_$UNIQUE 2;
+  decl R_ACK_$UNIQUE 4;
+  decl R_PAYLEN_$UNIQUE 2;
+  decl R_L4_$UNIQUE 2;
+  decl R_OFF_$UNIQUE 2;
+  decl R_HLEN_$UNIQUE 1;
+  decl R_IFINDEX_$UNIQUE 4;
+
+  get payload-len R_PAYLEN_$UNIQUE;
+  if R_PAYLEN_$UNIQUE eq 0;
+    get src-mac R_SRCMAC_$UNIQUE;
+    get dst-mac R_DSTMAC_$UNIQUE;
+    get ip-dst R_IPDST_$UNIQUE;
+    get tcp-src R_SPORT_$UNIQUE;
+    get tcp-dst R_DPORT_$UNIQUE;
+    get tcp-seq R_ACK_$UNIQUE;
+    calc add R_ACK_$UNIQUE 1;
+    calc hton R_ACK_$UNIQUE 32;
+    get l4-off R_L4_$UNIQUE;
+
+    # Reverse L2, L3, and L4 addressing. IP-address setters also maintain
+    # the IPv4 checksum; recalc-tcp-csum below covers all TCP changes.
+    set dst-mac %R_SRCMAC_$UNIQUE;
+    set src-mac %R_DSTMAC_$UNIQUE;
+    set ip-src %R_IPDST_$UNIQUE;
+    set ip-dst %IP;
+    set tcp-src %R_DPORT_$UNIQUE;
+    set tcp-dst %R_SPORT_$UNIQUE;
+
+    # RST|ACK, sequence 0, acknowledgement SYN.sequence + 1, window 0.
+    # TCP source/destination ports occupy bytes 0..3. Preserve the swapped
+    # ports written above; sequence number begins at byte 4.
+    set val R_OFF_$UNIQUE %R_L4_$UNIQUE;
+    calc add R_OFF_$UNIQUE 4;
+    set bytes %R_OFF_$UNIQUE 4 0;
+    calc add R_OFF_$UNIQUE 4;
+    set bytes %R_OFF_$UNIQUE 4 %R_ACK_$UNIQUE;
+    calc add R_OFF_$UNIQUE 5;
+    set bytes %R_OFF_$UNIQUE 1 0x14;
+    calc add R_OFF_$UNIQUE 1;
+    set bytes %R_OFF_$UNIQUE 2 0;
+
+    # Keep the existing TCP header length but neutralize SYN options as NOPs.
+    get tcp-hlen R_HLEN_$UNIQUE;
+    if R_HLEN_$UNIQUE gt 20;
+      calc sub R_HLEN_$UNIQUE 20;
+      set val R_OFF_$UNIQUE %R_L4_$UNIQUE;
+      calc add R_OFF_$UNIQUE 20;
+      fill-bytes %R_OFF_$UNIQUE %R_HLEN_$UNIQUE 1;
+    end-if;
+    recalc-tcp-csum;
+    # These values are no longer needed after the packet rewrite. Releasing
+    # them keeps two possible response sites within bpfc's eBPF stack budget.
+    free R_SRCMAC_$UNIQUE;
+    free R_DSTMAC_$UNIQUE;
+    free R_IPDST_$UNIQUE;
+    free R_SPORT_$UNIQUE;
+    free R_DPORT_$UNIQUE;
+    free R_ACK_$UNIQUE;
+    free R_PAYLEN_$UNIQUE;
+    free R_L4_$UNIQUE;
+    free R_OFF_$UNIQUE;
+    free R_HLEN_$UNIQUE;
+    when $XDP;
+      tx;
+    otherwise;
+      get skb-ifindex R_IFINDEX_$UNIQUE;
+      redirect %R_IFINDEX_$UNIQUE egress;
+    end-when;
+  end-if;
+  # Fast Open (or malformed) SYN with data: retain safe silent-drop behavior.
+  drop;
+end-define;
+
+# Track a qualifying TCP SYN or UDP service contact. $PROTO is 6 for TCP or
+# 17 for UDP; $PORT is a bpfc variable holding the destination port.
+define track-service PROTO PORT TCP_RESET_OK;
+  decl KEY_$UNIQUE 8;
+  decl PROTO_$UNIQUE 8;
+  decl RECORD_$UNIQUE 8;
+  decl FLOWLAST_$UNIQUE 8;
+  decl AGE_$UNIQUE 8;
+  decl SCORE_KEY_$UNIQUE 8;
+  decl SCORE_OLD_$UNIQUE 8;
+  decl SCORE_$UNIQUE 8;
+  decl WEIGHT_$UNIQUE 8;
+  decl UNTIL_$UNIQUE 8;
+
+  # A source-centric tuple is used deliberately: varying TCP source ports or
+  # retransmitted SYNs do not inflate the distinct-service score.
+  set val KEY_$UNIQUE %IP;
+  calc lsh KEY_$UNIQUE 32;
+  set val PROTO_$UNIQUE $PROTO;
+  calc lsh PROTO_$UNIQUE 16;
+  calc or KEY_$UNIQUE %PROTO_$UNIQUE;
+  calc or KEY_$UNIQUE $PORT;
+
+  # PS_LAST is the status-view record: monotonic second, protocol, target port.
+  set val RECORD_$UNIQUE %NOW;
+  calc lsh RECORD_$UNIQUE 32;
+  calc or RECORD_$UNIQUE %PROTO_$UNIQUE;
+  calc or RECORD_$UNIQUE $PORT;
+  set map PS_LAST %IP %RECORD_$UNIQUE;
+
+  # Atomically claim/refresh the tuple's observation time. xchg returns the
+  # previous timestamp, so parallel packets for the same tuple cannot all claim
+  # that the tuple was new.
+  calc-map xchg PS_FLOW %KEY_$UNIQUE %NOW FLOWLAST_$UNIQUE;
+
+  # Count a tuple only once per window. A missing map entry counts as new even
+  # during the first DEFAULT_WINDOW seconds after system boot.
+  if FLOWLAST_$UNIQUE eq 0;
+    set val AGE_$UNIQUE %WINDOW;
+  else;
+    set val AGE_$UNIQUE %NOW;
+    calc sub AGE_$UNIQUE %FLOWLAST_$UNIQUE;
+  end-if;
+  if AGE_$UNIQUE ge %WINDOW;
+    calc-map add PS_STATS 0 1;
+
+    # Each new destination service adds a static risk weight. The list is
+    # deliberately short and excludes common client-facing ports such as 80,
+    # 443, and 53. Treat it as a correlation signal, not an automatic verdict.
+    #
+    # The score key includes a fixed WINDOW-sized time bucket. This permits an
+    # atomic per-source update without a get-map/set-map race on a shared score.
+    # Scores reset at the next bucket boundary (rather than after a rolling
+    # quiet period), so a scan split exactly across a boundary can be less visible.
+
+    # Base score: any new TCP/UDP service contact.
+    set val WEIGHT_$UNIQUE 1;
+
+    # Tier 3 (total score 3): legacy/unauthenticated or high-risk service
+    # interfaces that are rarely expected from arbitrary external clients.
+    if $PORT eq 23;
+      set val WEIGHT_$UNIQUE 3;
+    end-if;
+    if $PORT eq 2375;
+      set val WEIGHT_$UNIQUE 3;
+    end-if;
+    if $PORT eq 6379;
+      set val WEIGHT_$UNIQUE 3;
+    end-if;
+    if $PORT eq 11211;
+      set val WEIGHT_$UNIQUE 3;
+    end-if;
+
+    # Tier 2 (total score 2): commonly targeted management, file-sharing,
+    # orchestration, database, cache, and infrastructure service ports.
+    if $PORT eq 22;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 111;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 135;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 139;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 161;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 445;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 1433;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 1521;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 2049;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 2379;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 3306;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 3389;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 5432;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 5900;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 5985;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 5986;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 6443;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 7547;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 9200;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 10250;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+    if $PORT eq 27017;
+      set val WEIGHT_$UNIQUE 2;
+    end-if;
+
+    # Atomically add this contact's weight to the source score for the current
+    # fixed time bucket. SCORE_OLD is the exact pre-increment value, even when
+    # multiple receive CPUs process this source concurrently.
+    set val SCORE_KEY_$UNIQUE %NOW;
+    calc div SCORE_KEY_$UNIQUE %WINDOW;
+    calc lsh SCORE_KEY_$UNIQUE 32;
+    calc or SCORE_KEY_$UNIQUE %IP;
+    calc-map add PS_SCORE %SCORE_KEY_$UNIQUE %WEIGHT_$UNIQUE SCORE_OLD_$UNIQUE;
+    set val SCORE_$UNIQUE %SCORE_OLD_$UNIQUE;
+    calc add SCORE_$UNIQUE %WEIGHT_$UNIQUE;
+
+    # In monitor mode, emit one static trace message when the source first
+    # crosses the threshold. debug-log cannot include dynamic IP/port values;
+    # consult PS_LAST/PS_SCORE with portscanctl.sh for those details.
+    if SCORE_$UNIQUE ge %THRESHOLD;
+      if MODE ne 0;
+        # The initial entry uses the configured base duration, bounded by max.
+        set val UNTIL_$UNIQUE %NOW;
+        if BLOCK_SECS ge %MAX_BLOCK_SECS;
+          calc add UNTIL_$UNIQUE %MAX_BLOCK_SECS;
+        else;
+          calc add UNTIL_$UNIQUE %BLOCK_SECS;
+        end-if;
+        set map PS_BLOCK %IP %UNTIL_$UNIQUE;
+        set map PS_BACKOFF %IP 0;
+        calc-map add PS_STATS 1 1;
+        if LOG ne 0;
+          debug-log ps_enforced;
+        end-if;
+        # Mode 1 silently drops. Mode 2 marks a qualifying TCP SYN for the
+        # outer block to rewrite as a TCP RST/ACK; UDP remains silently dropped.
+        if MODE eq 1;
+          drop;
+        else;
+          if MODE eq 2;
+            when $TCP_RESET_OK;
+              set val RESPOND 1;
+            otherwise;
+              drop;
+            end-when;
+          end-if;
+        end-if;
+      else;
+        # Weighted increments can cross a threshold without equaling it.
+        # Log only on the first crossing during the current score window.
+        if SCORE_OLD_$UNIQUE lt %THRESHOLD;
+          if LOG ne 0;
+            debug-log ps_suspect;
+          end-if;
+        end-if;
+      end-if;
+    end-if;
+  end-if;
+end-define;
+
+# This guard occurs before protocol classification. A blocked source therefore
+# has all IPv4 traffic dropped until its block expiry, not merely TCP/UDP scans.
+match ip;
+  decl NOW 8;
+  decl IP 4;
+  decl THRESHOLD 8;
+  decl BLOCK_SECS 8;
+  decl MAX_BLOCK_SECS 8;
+  decl WINDOW 8;
+  decl LOG 8;
+  decl MODE 8;
+  decl BLOCK_UNTIL 8;
+  decl BACKOFF_OLD 8;
+  decl BACKOFF_LEVEL 8;
+  decl ENFORCE_SECS 8;
+  decl RESPOND 1;
+  decl BLOCK_TCP_FLAGS 1;
+
+  set val RESPOND 0;
+  get time NOW;
+  calc div NOW 1000000000;
+  get ip-src IP;
+
+  # Initialize deployable defaults only if the respective config cell is zero.
+  # PS_CFG[2] and PS_CFG[4] intentionally remain zero by default (no tracing,
+  # monitor-only behavior).
+  get map PS_CFG 0 THRESHOLD;
+  if THRESHOLD eq 0;
+    set val THRESHOLD $DEFAULT_THRESHOLD;
+    set map PS_CFG 0 %THRESHOLD;
+  end-if;
+  get map PS_CFG 1 BLOCK_SECS;
+  if BLOCK_SECS eq 0;
+    set val BLOCK_SECS $DEFAULT_BLOCK_SECS;
+    set map PS_CFG 1 %BLOCK_SECS;
+  end-if;
+  get map PS_LIMIT 0 MAX_BLOCK_SECS;
+  if MAX_BLOCK_SECS eq 0;
+    set val MAX_BLOCK_SECS $DEFAULT_MAX_BLOCK_SECS;
+    set map PS_LIMIT 0 %MAX_BLOCK_SECS;
+  end-if;
+  get map PS_CFG 2 LOG;
+  get map PS_CFG 3 WINDOW;
+  if WINDOW eq 0;
+    set val WINDOW $DEFAULT_WINDOW;
+    set map PS_CFG 3 %WINDOW;
+  end-if;
+  get map PS_CFG 4 MODE;
+
+  get map PS_BLOCK %IP BLOCK_UNTIL;
+  if BLOCK_UNTIL ne 0;
+    if NOW lt %BLOCK_UNTIL;
+      # Exponential sliding enforcement: every later inbound packet advances
+      # PS_BACKOFF atomically. Renewals are base*2, base*4, base*8, and so on,
+      # capped by MAX_BLOCK_SECS. A fast sender reaches the cap quickly.
+      calc-map add PS_BACKOFF %IP 1 BACKOFF_OLD;
+      set val BACKOFF_LEVEL %BACKOFF_OLD;
+      calc add BACKOFF_LEVEL 1;
+      set val ENFORCE_SECS %BLOCK_SECS;
+      if BACKOFF_LEVEL ge 16;
+        # Bound the dynamic shift and cap extreme sustained traffic.
+        set val ENFORCE_SECS %MAX_BLOCK_SECS;
+      else;
+        calc lsh ENFORCE_SECS %BACKOFF_LEVEL;
+        if ENFORCE_SECS ge %MAX_BLOCK_SECS;
+          set val ENFORCE_SECS %MAX_BLOCK_SECS;
+        end-if;
+      end-if;
+      set val BLOCK_UNTIL %NOW;
+      calc add BLOCK_UNTIL %ENFORCE_SECS;
+      set map PS_BLOCK %IP %BLOCK_UNTIL;
+      calc-map add PS_STATS 2 1;
+      if LOG ne 0;
+        debug-log ps_enforced;
+      end-if;
+      if MODE eq 2;
+        match tcp;
+          get tcp-flags BLOCK_TCP_FLAGS;
+          calc and BLOCK_TCP_FLAGS 0x12;
+          if BLOCK_TCP_FLAGS eq 0x02;
+            set val RESPOND 1;
+          end-if;
+        end-match;
+        if RESPOND ne 0;
+          tcp-port-closed;
+        end-if;
+      end-if;
+      drop;
+    else;
+      # Full silence expires enforcement and starts the next incident at base.
+      set map PS_BLOCK %IP 0;
+      set map PS_BACKOFF %IP 0;
+    end-if;
+  end-if;
+
+  # Initial TCP connection attempts: SYN set and ACK clear. SYN retransmits
+  # refresh PS_FLOW/PS_LAST but do not add more than one score point per window.
+  match tcp;
+    decl TCP_FLAGS 1;
+    decl TCP_DPORT 2;
+    get tcp-flags TCP_FLAGS;
+    calc and TCP_FLAGS 0x12;
+    if TCP_FLAGS eq 0x02;
+      calc-map add PS_STATS 3 1;
+      get tcp-dst TCP_DPORT;
+      track-service 6 %TCP_DPORT 1;
+      if RESPOND ne 0;
+        tcp-port-closed;
+      end-if;
+    end-if;
+  end-match;
+
+  # UDP has no handshake. Treat its first observed packet per destination port
+  # in the window as a candidate contact; tune WINDOW/THRESHOLD accordingly.
+  match udp;
+    decl UDP_DPORT 2;
+    calc-map add PS_STATS 4 1;
+    get udp-dst UDP_DPORT;
+    track-service 17 %UDP_DPORT 0;
+  end-match;
+end-match;
